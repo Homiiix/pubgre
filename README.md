@@ -20,7 +20,20 @@ hardcoded addresses or interfaces.
 
 ## Install
 
+One line, on each host:
+
 ```bash
+curl -fsSL https://raw.githubusercontent.com/Homiiix/pubgre/main/install.sh | sudo bash
+```
+
+This downloads `pubgre` from this repository, checks it, and runs `pubgre install`. To
+install a specific commit or tag instead of `main`, put `PUBGRE_REF=<commit>` after
+`sudo`.
+
+Alternatively, download the script and install it yourself:
+
+```bash
+curl -fsSLo pubgre https://raw.githubusercontent.com/Homiiix/pubgre/main/pubgre
 sudo bash pubgre install
 ```
 
