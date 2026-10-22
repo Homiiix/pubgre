@@ -1,0 +1,1790 @@
+#!/usr/bin/env bash
+#
+# pubgre - carry a real public IPv4 address across a routed GRE tunnel.
+#
+#   [client router] --- [local host] ===== GRE ===== [foreign host] --- Internet
+#
+# The foreign host stops using one of its public addresses (T), answers ARP
+# for it on the provider segment with a targeted proxy-ARP entry, and routes
+# it into the tunnel. The local host routes T out of the NIC facing the client
+# router and answers the router's ARP for T's real provider gateway. The
+# router configures T as a plain static address with the real gateway and
+# never learns a tunnel exists. There is no NAT anywhere on the T path.
+#
+# Routed GRE + proxy ARP only: no GRETAP, VXLAN, bridging or MAC cloning, so
+# no second MAC address ever appears on a MAC-filtered provider port.
+#
+# See README.md for the design, the MTU math, every iptables rule, and how to
+# debug asymmetric routing and proxy-ARP failures.
+
+set -o nounset
+umask 077
+export LC_ALL=C
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3))); then
+    echo "pubgre: bash >= 4.3 is required" >&2
+    exit 1
+fi
+
+readonly PROG=pubgre
+readonly VERSION=1.0.0
+readonly CONF_DIR=/etc/pubgre
+readonly STATE_DIR=/var/lib/pubgre
+readonly RUN_DIR=/run/pubgre
+readonly BIN_PATH=/usr/local/sbin/pubgre
+readonly UNIT_PATH=/etc/systemd/system/pubgre@.service
+readonly SYSCTL_ORIG=$STATE_DIR/sysctl.orig # original values of every sysctl we changed
+readonly RT_PROTO=77                        # routing protocol id stamped on every route we add
+readonly TABLE_BASE=7100                    # each tunnel owns three routing tables from here
+readonly PRIO_BASE=7100                     # each tunnel owns ten ip-rule priorities from here
+readonly MAX_TUNNELS=200
+readonly GRE_OVERHEAD=28 # outer IPv4 header (20) + GRE header (4) + GRE key (4)
+readonly IF_PREFIX=pg-
+readonly METRIC_LAST=4294967295
+readonly LOOP_INTERVAL=15
+readonly VALUE_RE='^[A-Za-z0-9._:/,-]{0,64}$'
+
+readonly CONF_KEYS=" name role local_public remote_public egress_dev egress_gw tunnel_local tunnel_remote gre_key mtu transported_ip transported_gw transported_prefix transported_dev transported_mode client_dev client_arp_mode router_mac "
+readonly ALLOC_KEYS=" idx ifname table_main table_pin table_test prio "
+readonly ORIG_KEYS=" addr_dev addr_cidr addr_brd addr_scope addr_label addr_flags gw_addr_added router_mac_pinned "
+readonly FLAG_KEYS=" role name local-public remote-public tunnel-subnet egress-dev egress-gw gre-key mtu transported-ip transported-gw transported-mask transported-dev transported-mode client-dev client-arp-mode router-mac "
+
+# Loaded tunnel: config (C), allocation (A), recorded original state (O), and shorthands.
+declare -A C=() A=() O=() F=()
+NAME='' ROLE='' L='' R='' EG='' EGW='' TL='' TR='' KEY=0 MTU=0 T='' GW='' TP=0
+TD='' TMODE='' CD='' CAM='' RMAC='' IFN='' TM='' TPN='' TT='' PRIO=0
+DRY=0 CHANGES=0
+DRIFT=()
+PF_ACTIVE=0 HP_ACTIVE=0 HP_OLD='' TCPDUMP_PID='' TMP_FILE=''
+
+# ---------------------------------------------------------------- output
+
+if [[ -t 1 ]]; then
+    CR=$'\e[31m' CG=$'\e[32m' CY=$'\e[33m' CB=$'\e[1m' CN=$'\e[0m'
+else
+    CR='' CG='' CY='' CB='' CN=''
+fi
+say() { printf '%s\n' "$*"; }
+hdr() { printf '\n%s%s%s\n' "$CB" "$*" "$CN"; }
+ok() { printf '  %s[ ok ]%s %s\n' "$CG" "$CN" "$*"; }
+bad() { printf '  %s[FAIL]%s %s\n' "$CR" "$CN" "$*"; }
+note() { printf '  %s[ -- ]%s %s\n' "$CY" "$CN" "$*"; }
+kv() { printf '  %-20s %s\n' "$1" "$2"; }
+warn() { printf '%swarning:%s %s\n' "$CY" "$CN" "$*" >&2; }
+die() { printf '%serror:%s %s\n' "$CR" "$CN" "$*" >&2; exit 1; }
+need_root() { ((EUID == 0)) || die "must be run as root"; }
+has() { grep -E -- "$1" >/dev/null; } # reads all of stdin (no SIGPIPE on the writer)
+
+# ---------------------------------------------------------------- validation
+
+is_ipv4() {
+    local o='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])'
+    [[ $1 =~ ^$o\.$o\.$o\.$o$ ]]
+}
+is_unicast() {
+    is_ipv4 "$1" || return 1
+    local a=${1%%.*}
+    ((a != 0 && a != 127 && a < 224))
+}
+is_name() { [[ $1 =~ ^[a-z0-9][a-z0-9-]{0,9}$ ]]; }
+is_devname() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,14}$ ]]; }
+is_dev() { is_devname "$1" && [[ -e /sys/class/net/$1 ]]; }
+is_role() { [[ $1 == foreign || $1 == local ]]; }
+is_key() { [[ $1 =~ ^[0-9]{1,10}$ ]] && ((10#$1 >= 1 && 10#$1 <= 4294967295)); }
+is_mtu() { [[ $1 =~ ^[0-9]{3,4}$ ]] && ((10#$1 >= 576 && 10#$1 <= 9000)); }
+is_prefix() { [[ $1 =~ ^[0-9]{1,2}$ ]] && ((10#$1 >= 1 && 10#$1 <= 31)); }
+is_gw_or_none() { [[ $1 == none ]] || is_unicast "$1"; }
+is_tmode() { [[ $1 == onlink || $1 == routed ]]; }
+is_cam() { [[ $1 == proxy || $1 == gwaddr ]]; }
+is_mac() { [[ ${1,,} =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]]; }
+is_rmac() { [[ $1 == off || $1 == auto ]] || is_mac "$1"; }
+is_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535)); }
+is_local_addr() { is_unicast "$1" && [[ -n $(dev_of_addr "$1") ]]; }
+is_new_name() { is_name "$1" && [[ ! -e $CONF_DIR/$1.conf ]]; }
+
+# ---------------------------------------------------------------- IPv4 math
+
+ip2int() {
+    local a b c d
+    IFS=. read -r a b c d <<<"$1"
+    echo $(((a << 24) | (b << 16) | (c << 8) | d))
+}
+int2ip() { echo "$((($1 >> 24) & 255)).$((($1 >> 16) & 255)).$((($1 >> 8) & 255)).$(($1 & 255))"; }
+pfx2mask() { echo $(((0xFFFFFFFF << (32 - $1)) & 0xFFFFFFFF)); }
+net_of() { int2ip $(($(ip2int "$1") & $(pfx2mask "$2"))); }
+in_net() { (((($(ip2int "$1") ^ $(ip2int "$2")) & $(pfx2mask "$3")) == 0)); } # ip net prefix
+mask2pfx() {                                                                   # 24, /24 or 255.255.255.0
+    local m=${1#/} n p=0
+    if [[ $m =~ ^[0-9]{1,2}$ ]]; then
+        is_prefix "$m" && echo $((10#$m))
+        return
+    fi
+    is_ipv4 "$m" || return 1
+    n=$(ip2int "$m")
+    while ((n & 0x80000000)); do
+        p=$((p + 1))
+        n=$(((n << 1) & 0xFFFFFFFF))
+    done
+    ((n == 0)) && is_prefix "$p" && echo "$p"
+}
+is_mask() { mask2pfx "$1" >/dev/null; }
+re() { printf '%s' "${1//./\\.}"; } # escape dots for an ERE
+
+# "A,B" (foreign end, local end) or a /30 or /31 network -> "foreign local"
+parse_subnet() {
+    local s=$1 n p a b
+    if [[ $s =~ ^([0-9.]+),([0-9.]+)$ ]]; then
+        a=${BASH_REMATCH[1]} b=${BASH_REMATCH[2]}
+        is_unicast "$a" && is_unicast "$b" && [[ $a != "$b" ]] && echo "$a $b"
+        return
+    fi
+    [[ $s =~ ^([0-9.]+)/(30|31)$ ]] || return 1
+    n=${BASH_REMATCH[1]} p=${BASH_REMATCH[2]}
+    is_ipv4 "$n" && [[ $(net_of "$n" "$p") == "$n" ]] || return 1
+    if ((p == 30)); then a=$(($(ip2int "$n") + 1)); else a=$(ip2int "$n"); fi
+    b=$((a + 1))
+    echo "$(int2ip "$a") $(int2ip "$b")"
+}
+is_subnet() { parse_subnet "$1" >/dev/null; }
+
+# ---------------------------------------------------------------- files
+
+file_is_safe() {
+    local owner mode
+    owner=$(stat -c %u -- "$1" 2>/dev/null) || return 1
+    mode=$(stat -c %a -- "$1" 2>/dev/null) || return 1
+    [[ $owner == 0 ]] || { warn "$1 is not owned by root"; return 1; }
+    (((8#$mode & 8#022) == 0)) || { warn "$1 is group- or world-writable"; return 1; }
+}
+
+# read_kv <file> <allowed keys> <assoc name>: strict key=value parser. Nothing is sourced or evaluated.
+read_kv() {
+    local file=$1 allowed=$2 line k n=0
+    local -n _kv_out=$3
+    file_is_safe "$file" || die "refusing to read unsafe file $file"
+    while IFS= read -r line || [[ -n $line ]]; do
+        n=$((n + 1))
+        [[ $line =~ ^[[:space:]]*(#.*)?$ ]] && continue
+        [[ $line =~ ^([a-z][a-z0-9_]*)=([A-Za-z0-9._:/,-]{0,64})$ ]] ||
+            die "$file:$n: malformed line (expected key=value, no quotes, spaces or shell syntax)"
+        k=${BASH_REMATCH[1]}
+        [[ $allowed == *" $k "* ]] || die "$file:$n: unknown key '$k'"
+        _kv_out[$k]=${BASH_REMATCH[2]}
+    done <"$file"
+}
+
+write_kv() { # write_kv <file> <assoc name>
+    local file=$1 tmp k
+    local -n _kv_in=$2
+    for k in "${!_kv_in[@]}"; do
+        [[ ${_kv_in[$k]} =~ $VALUE_RE ]] || die "internal: refusing to write unsafe value for $k"
+    done
+    tmp=$(mktemp "$file.XXXXXX") || die "cannot write $file"
+    {
+        printf '# managed by %s %s; values are validated on every load\n' "$PROG" "$VERSION"
+        for k in $(printf '%s\n' "${!_kv_in[@]}" | sort); do
+            printf '%s=%s\n' "$k" "${_kv_in[$k]}"
+        done
+    } >"$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$file" || {
+        rm -f "$tmp"
+        die "cannot write $file"
+    }
+}
+
+lock() {
+    mkdir -p "$RUN_DIR" && exec 9>"$RUN_DIR/lock" || die "cannot open lock file"
+    flock -w 60 9 || die "another $PROG operation is running"
+}
+unlock() { flock -u 9 2>/dev/null; }
+
+tunnel_names() {
+    local f n
+    for f in "$CONF_DIR"/*.conf; do
+        [[ -e $f ]] || continue
+        n=${f##*/}
+        n=${n%.conf}
+        is_name "$n" && echo "$n"
+    done
+}
+
+# ---------------------------------------------------------------- config
+
+validate_conf() {
+    local -a e=()
+    local k
+    is_name "${C[name]:-}" || e+=(name)
+    is_role "${C[role]:-}" || e+=(role)
+    for k in local_public remote_public tunnel_local tunnel_remote transported_ip transported_gw; do
+        is_unicast "${C[$k]:-}" || e+=("$k")
+    done
+    is_devname "${C[egress_dev]:-}" || e+=(egress_dev)
+    is_gw_or_none "${C[egress_gw]:-}" || e+=(egress_gw)
+    is_key "${C[gre_key]:-}" || e+=(gre_key)
+    is_mtu "${C[mtu]:-}" || e+=(mtu)
+    is_prefix "${C[transported_prefix]:-}" || e+=(transported_prefix)
+    if [[ ${C[role]:-} == foreign ]]; then
+        is_devname "${C[transported_dev]:-}" || e+=(transported_dev)
+        is_tmode "${C[transported_mode]:-}" || e+=(transported_mode)
+    else
+        is_devname "${C[client_dev]:-}" || e+=(client_dev)
+        is_cam "${C[client_arp_mode]:-}" || e+=(client_arp_mode)
+        is_rmac "${C[router_mac]:-}" || e+=(router_mac)
+    fi
+    ((${#e[@]} == 0)) || die "invalid or missing configuration values: ${e[*]}"
+
+    local l=${C[local_public]} r=${C[remote_public]} t=${C[transported_ip]} g=${C[transported_gw]}
+    local tl=${C[tunnel_local]} tr=${C[tunnel_remote]} p=${C[transported_prefix]}
+    [[ $l != "$r" ]] || die "local-public and remote-public must differ"
+    [[ $tl != "$tr" ]] || die "the two tunnel addresses must differ"
+    for k in "$l" "$r" "$tl" "$tr"; do
+        [[ $t != "$k" ]] || die "transported-ip $t collides with a tunnel address"
+    done
+    for k in "$tl" "$tr"; do
+        [[ $k != "$l" && $k != "$r" ]] || die "tunnel-subnet address $k collides with a public endpoint"
+    done
+    [[ $g != "$t" ]] || die "transported-gw cannot equal transported-ip"
+    in_net "$g" "$t" "$p" || die "transported-gw $g is not inside $t/$p; the router must reach its gateway on-link"
+    [[ ${C[egress_gw]} != "$l" ]] || die "egress-gw cannot be this host's own address"
+    if [[ ${C[role]} == local ]]; then
+        [[ ${C[client_dev]} != "${C[egress_dev]}" ]] || die "client-dev must not be the egress NIC"
+    fi
+}
+
+apply_conf() {
+    NAME=${C[name]} ROLE=${C[role]} L=${C[local_public]} R=${C[remote_public]}
+    EG=${C[egress_dev]} EGW=${C[egress_gw]} TL=${C[tunnel_local]} TR=${C[tunnel_remote]}
+    KEY=$((10#${C[gre_key]})) MTU=$((10#${C[mtu]}))
+    T=${C[transported_ip]} GW=${C[transported_gw]} TP=$((10#${C[transported_prefix]}))
+    TD=${C[transported_dev]:-} TMODE=${C[transported_mode]:-}
+    CD=${C[client_dev]:-} CAM=${C[client_arp_mode]:-} RMAC=${C[router_mac]:-}
+    RMAC=${RMAC,,}
+    IFN=$IF_PREFIX$NAME
+}
+
+validate_alloc() {
+    local i=${A[idx]:-x}
+    [[ $i =~ ^[0-9]{1,3}$ ]] && ((10#$i < MAX_TUNNELS)) || die "corrupt allocation state (idx)"
+    i=$((10#$i))
+    [[ ${A[ifname]:-} == "$IF_PREFIX${C[name]}" ]] || die "corrupt allocation state (ifname)"
+    [[ ${A[table_main]:-} == $((TABLE_BASE + 3 * i)) && ${A[table_pin]:-} == $((TABLE_BASE + 3 * i + 1)) &&
+        ${A[table_test]:-} == $((TABLE_BASE + 3 * i + 2)) && ${A[prio]:-} == $((PRIO_BASE + 10 * i)) ]] ||
+        die "corrupt allocation state (tables/priorities)"
+}
+
+validate_orig() {
+    local v
+    v=${O[addr_dev]:-}; [[ -z $v ]] || is_devname "$v" || die "corrupt state: addr_dev"
+    v=${O[addr_cidr]:-}
+    if [[ -n $v ]]; then
+        [[ $v =~ ^([0-9.]+)/([0-9]{1,2})$ ]] && [[ ${BASH_REMATCH[1]} == "$T" ]] &&
+            ((10#${BASH_REMATCH[2]} <= 32)) || die "corrupt state: addr_cidr"
+    fi
+    v=${O[addr_brd]:-}; [[ -z $v ]] || is_ipv4 "$v" || die "corrupt state: addr_brd"
+    v=${O[addr_scope]:-}; [[ -z $v || $v =~ ^(global|site|link|host|[0-9]{1,3})$ ]] || die "corrupt state: addr_scope"
+    v=${O[addr_label]:-}; [[ -z $v || $v =~ ^[A-Za-z0-9._:-]{1,15}$ ]] || die "corrupt state: addr_label"
+    v=${O[addr_flags]:-}; [[ -z $v || $v =~ ^[a-z,-]+$ ]] || die "corrupt state: addr_flags"
+    v=${O[gw_addr_added]:-}; [[ -z $v || $v == 1 ]] || die "corrupt state: gw_addr_added"
+    v=${O[router_mac_pinned]:-}; [[ -z $v ]] || is_mac "$v" || die "corrupt state: router_mac_pinned"
+}
+
+load_tunnel() {
+    local name=$1
+    is_name "$name" || die "invalid tunnel name '$name'"
+    [[ -f $CONF_DIR/$name.conf ]] || die "no tunnel '$name' ($CONF_DIR/$name.conf not found)"
+    C=() A=() O=()
+    read_kv "$CONF_DIR/$name.conf" "$CONF_KEYS" C
+    [[ ${C[name]:-} == "$name" ]] || die "$CONF_DIR/$name.conf: name= does not match the file name"
+    validate_conf
+    [[ -f $STATE_DIR/$name/alloc ]] || die "allocation state for '$name' is missing; re-create the tunnel"
+    read_kv "$STATE_DIR/$name/alloc" "$ALLOC_KEYS" A
+    validate_alloc
+    apply_conf
+    TM=${A[table_main]} TPN=${A[table_pin]} TT=${A[table_test]} PRIO=${A[prio]}
+    [[ -f $STATE_DIR/$name/orig ]] && read_kv "$STATE_DIR/$name/orig" "$ORIG_KEYS" O
+    validate_orig
+    command -v ip >/dev/null && command -v iptables >/dev/null || die "iproute2 and iptables are required"
+}
+
+save_orig() {
+    ((DRY)) && return 0
+    mkdir -p "$STATE_DIR/$NAME"
+    write_kv "$STATE_DIR/$NAME/orig" O
+}
+
+# ---------------------------------------------------------------- host inspection
+
+addr_line() { ip -o -4 addr show 2>/dev/null | awk -v ip="$1" '{split($4, a, "/")} a[1] == ip && !f {print; f = 1}'; }
+dev_of_addr() { addr_line "$1" | awk '{sub(/@.*/, "", $2); print $2}'; }
+dev_addrs() { ip -o -4 addr show dev "$1" scope global 2>/dev/null | awk '$5 != "peer" {split($4, a, "/"); print a[1]}'; }
+dev_cidrs() { ip -o -4 addr show dev "$1" scope global 2>/dev/null | awk '$5 != "peer" {print $4}'; }
+dev_mtu() { local m; read -r m 2>/dev/null <"/sys/class/net/$1/mtu" && echo "$m"; }
+is_up() { ip -o link show dev "$1" 2>/dev/null | has '[<,]UP[,>]'; }
+dev_gw() { # first default gateway seen on a device, any table
+    ip -4 route show table all 2>/dev/null | awk -v d="$1" '
+        $1 == "default" && !f { g = ""; v = ""
+            for (i = 2; i < NF; i++) { if ($i == "via") g = $(i + 1); if ($i == "dev") v = $(i + 1) }
+            if (v == d && g != "") { print g; f = 1 } }'
+}
+route_field() { # route_field <field> <ip route get args...>
+    local f=$1
+    shift
+    ip -4 -o route get "$@" 2>/dev/null | awk -v f="$f" '!d { for (i = 1; i < NF; i++) if ($i == f) { print $(i + 1); break }; d = 1 }'
+}
+
+# "ip -o -4 addr" line -> PA_DEV PA_CIDR PA_BRD PA_SCOPE PA_LABEL PA_FLAGS
+parse_addr_line() {
+    local -a t
+    local i
+    read -ra t <<<"${1%%\\*}"
+    PA_DEV=${t[1]%%@*} PA_CIDR=${t[3]:-} PA_BRD='' PA_SCOPE='' PA_LABEL='' PA_FLAGS=''
+    for ((i = 4; i < ${#t[@]}; i++)); do
+        case ${t[i]} in
+            brd) PA_BRD=${t[i + 1]:-}; i=$((i + 1)) ;;
+            scope) PA_SCOPE=${t[i + 1]:-}; i=$((i + 1)) ;;
+            peer) return 1 ;;
+            metric | proto | valid_lft | preferred_lft) i=$((i + 1)) ;;
+            secondary | dynamic | noprefixroute | deprecated | tentative | permanent | nodad | home | \
+                mngtmpaddr | temporary | optimistic | dadfailed | stable-privacy | autojoin)
+                PA_FLAGS+="${PA_FLAGS:+,}${t[i]}" ;;
+            *) PA_LABEL=${t[i]} ;;
+        esac
+    done
+    [[ $PA_CIDR == */* ]] || PA_CIDR+=/32
+}
+
+# Management sessions as "server-address client-address" pairs: $SSH_CONNECTION plus every
+# established connection to the sshd port(s).
+ssh_ports() {
+    local p
+    p=$(awk 'tolower($1) == "port" && $2 ~ /^[0-9]+$/ {print $2}' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null | sort -u)
+    echo "${p:-22}"
+}
+mgmt_sessions() {
+    local ports c cp s sp line la lp pa
+    ports=" $(ssh_ports | tr '\n' ' ') "
+    if [[ -n ${SSH_CONNECTION:-} ]]; then
+        read -r c cp s sp <<<"$SSH_CONNECTION"
+        is_ipv4 "$s" && is_ipv4 "$c" && echo "$s $c"
+    fi
+    while read -r _ _ la pa _; do
+        [[ $la == *:* && $pa == *:* ]] || continue
+        lp=${la##*:}
+        la=${la%:*} pa=${pa%:*}
+        la=${la#::ffff:} pa=${pa#::ffff:}
+        [[ $ports == *" $lp "* ]] && is_ipv4 "$la" && is_ipv4 "$pa" && echo "$la $pa"
+    done < <(ss -4 -tn state established 2>/dev/null | awk 'NR > 1 || $1 != "Recv-Q"')
+}
+
+# Refuse any change that could cut the path you are managing this host through.
+mgmt_check() {
+    local s c dev via sdev
+    while read -r s c; do
+        [[ -n $s ]] || continue
+        [[ $ROLE == foreign && $s == "$T" ]] &&
+            die "you are connected to this host via $T, which pubgre would remove from $TD. Connect via another address first."
+        [[ $c == "$T" ]] &&
+            die "your management session comes from $T; pubgre would reroute $T and cut it."
+        [[ $ROLE == local && $CAM == gwaddr && $c == "$GW" ]] &&
+            die "your management session comes from $GW, which gwaddr mode would claim on $CD."
+        if [[ $s == "$L" && $c == "$R" ]]; then
+            dev=$(route_field dev "$R" from "$L")
+            via=$(route_field via "$R" from "$L")
+            if [[ $dev != "$EG" || ($EGW != none && $via != "$EGW") || ($EGW == none && -n $via) ]]; then
+                die "your SSH session runs $L -> $R via ${via:-direct} dev ${dev:-?}; pinning the tunnel would move that path to ${EGW/none/direct} dev $EG. Manage this host from another address or fix --egress-gw."
+            fi
+        fi
+        if [[ $ROLE == local && $CAM == proxy ]]; then
+            sdev=$(dev_of_addr "$s")
+            [[ $sdev == "$CD" ]] &&
+                die "your SSH session arrives on $CD. Proxy ARP there would answer ARP for other hosts on that LAN. Use a dedicated link to the router or --client-arp-mode gwaddr."
+        fi
+    done < <(mgmt_sessions)
+    if [[ $ROLE == foreign ]]; then
+        ip -4 route show default 2>/dev/null | has "src $(re "$T")( |$)" &&
+            die "$T is the source address of this host's default route; removing it would break the host's own connectivity"
+    fi
+}
+
+persistent_hint() {
+    local hits
+    hits=$(grep -rlsF -- "$T" /etc/netplan /etc/network/interfaces /etc/network/interfaces.d /etc/systemd/network 2>/dev/null | tr '\n' ' ')
+    [[ -n $hits ]] && warn "$T appears in persistent network config ($hits). The OS may re-add it on link events; pubgre removes it again within ${LOOP_INTERVAL}s. Remove it there for a clean setup."
+    return 0
+}
+
+# Checks against the live host; run by create and up.
+runtime_check() {
+    local line n
+    is_dev "$EG" || die "egress device $EG does not exist"
+    [[ $(dev_of_addr "$L") == "$EG" ]] || die "$L is not configured on $EG"
+    if [[ $ROLE == foreign ]]; then
+        is_dev "$TD" || die "transported-dev $TD does not exist"
+        line=$(addr_line "$T")
+        if [[ -n $line ]]; then
+            parse_addr_line "$line" || die "$T is configured as a point-to-point (peer) address; not supported"
+            [[ ,$PA_FLAGS, == *,dynamic,* ]] && die "$T on $PA_DEV is DHCP-assigned; make it static before handing it to pubgre"
+            [[ $PA_DEV == "$TD" ]] || warn "$T is on $PA_DEV, not $TD; it will be removed from $PA_DEV and proxy-ARP'ed on $TD"
+            n=$(dev_cidrs "$PA_DEV" | wc -l)
+            ((n <= 1)) && warn "$T is the only address on $PA_DEV. The host will ARP for $GW with a sender address from another NIC, which some providers ignore."
+        fi
+    else
+        is_dev "$CD" || die "client-dev $CD does not exist"
+        ip -4 route show default 2>/dev/null | has "dev $(re "$CD")( |$)" &&
+            die "$CD carries a default route; client-dev must be the dedicated link to the router"
+        [[ -n $(dev_of_addr "$T") ]] && die "$T is configured on this host; on the local side it belongs to the router"
+        n=$(dev_of_addr "$GW")
+        [[ -n $n && ! ($CAM == gwaddr && $n == "$CD") ]] && die "$GW is configured on $n on this host"
+        if [[ $CAM == proxy && -n $(dev_addrs "$CD") ]]; then
+            warn "$CD has its own addresses. With proxy ARP it answers ARP for every off-link address, so only the router should be on that segment."
+        fi
+    fi
+}
+
+# ---------------------------------------------------------------- change primitives
+
+# act <description> <command...>: run (and log) a change, or record it as drift in check mode.
+act() {
+    local desc=$1
+    shift
+    if ((DRY)); then
+        DRIFT+=("$desc")
+        return 0
+    fi
+    CHANGES=$((CHANGES + 1))
+    if "$@"; then
+        printf '  %s\n' "$desc"
+    else
+        warn "failed: $desc"
+        return 1
+    fi
+}
+
+sysctl_ok_path() { [[ $1 =~ ^net/ipv4/(ip_forward|(conf|neigh)/[A-Za-z0-9._-]{1,15}/[a-z_]{1,32})$ && $1 != *..* ]]; }
+sysctl_get() {
+    local v
+    sysctl_ok_path "$1" && read -r v 2>/dev/null <"/proc/sys/$1" && printf '%s' "$v"
+}
+sysctl_put() { sysctl_ok_path "$1" && printf '%s\n' "$2" >"/proc/sys/$1"; }
+orig_sysctl_get() {
+    [[ -f $SYSCTL_ORIG ]] || return 1
+    awk -F= -v p="$1" '$1 == p && !f {print $2; f = 1} END {exit !f}' "$SYSCTL_ORIG"
+}
+# set_sysctl <path> <value> [record=1]: the first original value is kept for restore.
+set_sysctl() {
+    local p=$1 want=$2 rec=${3:-1} cur
+    cur=$(sysctl_get "$p") || { warn "sysctl $p is not available"; return 1; }
+    [[ $cur == "$want" ]] && return 0
+    act "sysctl $p=$want (was $cur)" _set_sysctl "$p" "$want" "$cur" "$rec"
+}
+_set_sysctl() {
+    if (($4)) && ! orig_sysctl_get "$1" >/dev/null; then
+        mkdir -p "$STATE_DIR" && printf '%s=%s\n' "$1" "$3" >>"$SYSCTL_ORIG" && chmod 600 "$SYSCTL_ORIG"
+    fi
+    sysctl_put "$1" "$2"
+}
+# restore_sysctls <regex>: write back recorded originals whose path matches, and forget them.
+restore_sysctls() {
+    [[ -f $SYSCTL_ORIG ]] || return 0
+    file_is_safe "$SYSCTL_ORIG" || return 1
+    local line p v
+    local -a keep=()
+    while IFS= read -r line; do
+        [[ $line =~ ^(net/ipv4/[A-Za-z0-9._/-]+)=(-?[0-9]{1,10})$ ]] && sysctl_ok_path "${BASH_REMATCH[1]}" || continue
+        p=${BASH_REMATCH[1]} v=${BASH_REMATCH[2]}
+        if [[ $p =~ $1 ]]; then
+            [[ -e /proc/sys/$p ]] && act "restore sysctl $p=$v" sysctl_put "$p" "$v"
+            continue
+        fi
+        keep+=("$line")
+    done <"$SYSCTL_ORIG"
+    if ((${#keep[@]})); then
+        printf '%s\n' "${keep[@]}" >"$SYSCTL_ORIG.new" && mv -f "$SYSCTL_ORIG.new" "$SYSCTL_ORIG"
+    else
+        rm -f "$SYSCTL_ORIG"
+    fi
+}
+# Another tunnel that is currently up uses this device for its own sysctls.
+dev_used_elsewhere() {
+    local n
+    local -A X
+    while read -r n; do
+        [[ $n == "$NAME" ]] && continue
+        [[ -e /sys/class/net/$IF_PREFIX$n ]] || continue
+        X=()
+        read_kv "$CONF_DIR/$n.conf" "$CONF_KEYS" X
+        [[ ${X[transported_dev]:-} == "$1" || ${X[client_dev]:-} == "$1" ]] && return 0
+    done < <(tunnel_names)
+    return 1
+}
+restore_dev_sysctls() {
+    [[ -n $1 ]] || return 0
+    if dev_used_elsewhere "$1"; then
+        say "  keeping sysctls on $1: another pubgre tunnel uses it"
+        return 0
+    fi
+    restore_sysctls "^net/ipv4/(conf|neigh)/$(re "$1")/"
+}
+
+# ensure_route <table> <regex> <ip route args...>
+#   The regex is matched against "ip route show table <table> proto 77". When nothing
+#   matches, the route is (re)installed with "ip route replace".
+ensure_route() {
+    local tbl=$1 rx=$2
+    shift 2
+    ip -4 route show table "$tbl" proto "$RT_PROTO" 2>/dev/null | has "$rx" && return 0
+    act "route [table $tbl] $*" ip -4 route replace "$@" table "$tbl" proto "$RT_PROTO"
+}
+# prune_table <table> <regex...>: delete routes in one of OUR tables that match none of the regexes.
+prune_table() {
+    local tbl=$1 line rx keep w
+    shift
+    local -a parts args
+    while IFS= read -r line; do
+        [[ -n $line ]] || continue
+        keep=0
+        for rx in "$@"; do
+            [[ -n $rx ]] && has "$rx" <<<"$line" && { keep=1; break; }
+        done
+        ((keep)) && continue
+        read -ra parts <<<"$line"
+        args=()
+        for w in "${parts[@]}"; do
+            case $w in linkdown | dead | offload | trap | rt_offload | rt_trap | pervasive) ;; *) args+=("$w") ;; esac
+        done
+        act "remove stale route [table $tbl] $line" ip -4 route del "${args[@]}" table "$tbl"
+    done < <(ip -4 route show table "$tbl" 2>/dev/null)
+}
+
+rule_lines() { ip -4 rule show 2>/dev/null | awk -v p="$1:" '$1 == p'; }
+rules_ours() { # every rule line looks up one of this tunnel's tables
+    local line
+    while IFS= read -r line; do
+        [[ -z $line || $line =~ lookup\ ($TM|$TPN|$TT)([[:space:]]|$) ]] || return 1
+    done <<<"$1"
+}
+del_rules_pref() {
+    local n=0
+    while [[ -n $(rule_lines "$1") ]]; do
+        ip -4 rule del pref "$1" || return 1
+        n=$((n + 1))
+        ((n < 20)) || return 1
+    done
+}
+# ensure_rule <pref> <regex> <selector...>
+ensure_rule() {
+    local pref=$1 rx=$2 cur
+    shift 2
+    cur=$(rule_lines "$pref")
+    if [[ -n $cur && $(wc -l <<<"$cur") == 1 ]] && has "$rx" <<<"$cur"; then return 0; fi
+    if [[ -n $cur ]]; then
+        rules_ours "$cur" || { warn "ip rule priority $pref is used by something else; not touching it"; return 1; }
+        act "remove stale rule $pref" del_rules_pref "$pref"
+    fi
+    act "rule $pref: $*" ip -4 rule add pref "$pref" "$@"
+}
+
+# ---------------------------------------------------------------- iptables
+
+ipt() { iptables -w 5 "$@"; }
+ipt_tag() { printf 'pubgre_%s_%s' "$NAME" "$1"; }
+ipt_ours() { # our rules in one table, "-S" form, quotes stripped (our comments never contain spaces)
+    ipt -t "$1" -S 2>/dev/null | tr -d '"' | grep -E -- "--comment pubgre_${NAME}_[a-z0-9-]+( |$)"
+}
+ipt_del_line() {
+    local -a a
+    [[ $2 == "-A "* ]] || return 1
+    read -ra a <<<"${2#-A }"
+    ipt -t "$1" -D "${a[@]}"
+}
+ipt_remove_all() {
+    local tbl line
+    for tbl in filter mangle nat; do
+        while IFS= read -r line; do
+            [[ -n $line ]] && act "iptables -t $tbl: remove ${line#-A }" ipt_del_line "$tbl" "$line"
+        done < <(ipt_ours "$tbl")
+    done
+}
+# ipt_is_early <table> <chain> <tag>: no rule we do not own sits above ours. Another tool
+# inserting a MASQUERADE or DROP at position 1 later would otherwise shadow our rule.
+ipt_is_early() {
+    ipt -t "$1" -S "$2" 2>/dev/null | tr -d '"' | awk -v tag="--comment $3" '
+        /^-A / && !done {
+            if (index($0, tag " ") || substr($0, length($0) - length(tag) + 1) == tag) { found = 1; done = 1 }
+            else if ($0 !~ /--comment pubgre_/) done = 1
+        }
+        END { exit !found }'
+}
+ipt_count() { # packets matched by one of our rules (table, purpose)
+    ipt -t "$1" -L -v -n -x 2>/dev/null | awk -v tag="/* pubgre_${NAME}_$2 */" 'index($0, tag) && !f {print $1; f = 1}'
+}
+
+# One line per rule: "table chain purpose|match args|target args". Every rule only matches
+# this tunnel's interface or transported address, never a port, never SSH.
+desired_ipt() {
+    echo "filter INPUT gre-in|-i $EG -s $R/32 -d $L/32 -p 47|-j ACCEPT"
+    if [[ $ROLE == foreign ]]; then
+        echo "filter FORWARD fwd-in|-i $TD -o $IFN -d $T/32|-j ACCEPT"
+        echo "filter FORWARD fwd-out|-i $IFN -o $TD -s $T/32|-j ACCEPT"
+    else
+        echo "filter FORWARD fwd-in|-i $IFN -o $CD -d $T/32|-j ACCEPT"
+        echo "filter FORWARD fwd-out|-i $CD -o $IFN -s $T/32|-j ACCEPT"
+    fi
+    echo "mangle FORWARD mss|-o $IFN -p tcp --tcp-flags SYN,RST SYN|-j TCPMSS --clamp-mss-to-pmtu"
+    echo "nat PREROUTING nonat-in|-d $T/32|-j RETURN"
+    echo "nat POSTROUTING nonat-out|-s $T/32|-j RETURN"
+}
+
+ensure_iptables() {
+    local head match target tbl chain purpose tag line p
+    local -a m tg
+    local -A want=()
+    while IFS='|' read -r head match target; do
+        read -r tbl chain purpose <<<"$head"
+        tag=$(ipt_tag "$purpose")
+        want["$tbl:$purpose"]=1
+        read -ra m <<<"$match"
+        read -ra tg <<<"$target"
+        if ipt -t "$tbl" -C "$chain" "${m[@]}" -m comment --comment "$tag" "${tg[@]}" 2>/dev/null; then
+            ipt_is_early "$tbl" "$chain" "$tag" && continue
+            say "  $purpose rule is no longer above other rules in $tbl/$chain; moving it back to the top"
+        fi
+        while IFS= read -r line; do
+            [[ -n $line ]] && act "iptables -t $tbl: drop outdated $purpose rule" ipt_del_line "$tbl" "$line"
+        done < <(ipt_ours "$tbl" | grep -E -- "--comment $tag( |$)")
+        act "iptables -t $tbl -I $chain 1 $match ($purpose) $target" \
+            ipt -t "$tbl" -I "$chain" 1 "${m[@]}" -m comment --comment "$tag" "${tg[@]}"
+    done < <(desired_ipt)
+    for tbl in filter mangle nat; do
+        while IFS= read -r line; do
+            [[ $line =~ --comment\ pubgre_${NAME}_([a-z0-9-]+) ]] || continue
+            p=${BASH_REMATCH[1]}
+            [[ -n ${want["$tbl:$p"]:-} ]] || act "iptables -t $tbl: remove obsolete $p rule" ipt_del_line "$tbl" "$line"
+        done < <(ipt_ours "$tbl")
+    done
+}
+
+# ---------------------------------------------------------------- tunnel interface
+
+tun_owned() {
+    local a=''
+    read -r a 2>/dev/null <"/sys/class/net/$IFN/ifalias"
+    [[ $a == "pubgre:$NAME" ]]
+}
+tun_matches() {
+    local d iflink egidx krx
+    d=$(ip -d -o link show dev "$IFN" 2>/dev/null) || return 1
+    [[ $d == *"link/gre $L peer $R "* ]] || return 1
+    krx="($KEY|$(re "$(int2ip "$KEY")"))([[:space:]]|$)"
+    [[ $d =~ ikey\ $krx && $d =~ okey\ $krx ]] || return 1
+    read -r iflink 2>/dev/null <"/sys/class/net/$IFN/iflink" &&
+        read -r egidx 2>/dev/null <"/sys/class/net/$EG/ifindex" && [[ $iflink == "$egidx" ]]
+}
+create_tunnel() {
+    ip tunnel add "$IFN" mode gre local "$L" remote "$R" ttl 255 key "$KEY" dev "$EG" &&
+        ip link set dev "$IFN" alias "pubgre:$NAME"
+}
+recreate_tunnel() { ip link del dev "$IFN" && create_tunnel; }
+
+ensure_tunnel() { # ensure_tunnel <mtu>
+    local want=$1 cur
+    if [[ -e /sys/class/net/$IFN ]]; then
+        tun_owned || { warn "$IFN exists but was not created by $PROG; refusing to touch it"; return 1; }
+        tun_matches || act "recreate $IFN (parameters changed)" recreate_tunnel || return 1
+    else
+        [[ -e /sys/class/net/$EG ]] || { warn "egress device $EG is missing; cannot create $IFN"; return 1; }
+        act "create GRE $IFN: local $L remote $R key $KEY, bound to $EG" create_tunnel || return 1
+    fi
+    [[ -e /sys/class/net/$IFN ]] || return 0 # check mode, interface absent
+    cur=$(dev_mtu "$IFN")
+    [[ $cur == "$want" ]] || act "mtu $IFN $want (was $cur)" ip link set dev "$IFN" mtu "$want"
+    is_up "$IFN" || act "link $IFN up" ip link set dev "$IFN" up
+    cur=$(ip -o -4 addr show dev "$IFN" 2>/dev/null)
+    if ! { has "inet $(re "$TL") peer $(re "$TR")/32 " <<<"$cur" && [[ $(grep -c ' inet ' <<<"$cur") == 1 ]]; }; then
+        [[ -n $cur ]] && act "flush addresses on $IFN" ip addr flush dev "$IFN"
+        act "address $TL peer $TR on $IFN" ip addr add "$TL" peer "$TR/32" dev "$IFN"
+    fi
+    set_sysctl "net/ipv4/conf/$IFN/rp_filter" 2 0
+    set_sysctl "net/ipv4/conf/$IFN/forwarding" 1 0
+    set_sysctl "net/ipv4/conf/$IFN/accept_redirects" 0 0
+    set_sysctl "net/ipv4/conf/$IFN/send_redirects" 0 0
+}
+
+# Outer GRE packets from L to R always use the egress NIC and its gateway, whatever the
+# default route does. The blackhole keeps them from leaking elsewhere when that NIC is down.
+ensure_pin() {
+    local rx_u rx_b
+    rx_b="^blackhole $(re "$R")( |$)"
+    if [[ $EGW == none ]]; then
+        rx_u="^$(re "$R") dev $(re "$EG")( |$)"
+        ensure_route "$TPN" "$rx_u" "$R/32" dev "$EG"
+    else
+        rx_u="^$(re "$R") via $(re "$EGW") dev $(re "$EG")( |$)"
+        ensure_route "$TPN" "$rx_u" "$R/32" via "$EGW" dev "$EG" onlink
+    fi
+    ensure_route "$TPN" "$rx_b" blackhole "$R/32" metric "$METRIC_LAST"
+    prune_table "$TPN" "$rx_u" "$rx_b"
+    ensure_rule "$PRIO" "from $(re "$L") to $(re "$R") lookup $TPN( |$)" from "$L/32" to "$R/32" lookup "$TPN"
+}
+
+ensure_module() {
+    [[ -d /sys/module/ip_gre ]] || act "load kernel module ip_gre" modprobe ip_gre
+}
+
+# ---------------------------------------------------------------- foreign role
+
+ensure_t_removed() {
+    local line
+    line=$(addr_line "$T")
+    [[ -n $line ]] || return 0
+    parse_addr_line "$line" || { warn "$T is a peer address; not touching it"; return 1; }
+    if [[ ,$PA_FLAGS, == *,dynamic,* ]]; then
+        warn "$T on $PA_DEV is DHCP-assigned; refusing to remove it"
+        return 1
+    fi
+    if ((!DRY)) && [[ -z ${O[addr_cidr]:-} ]]; then
+        O[addr_dev]=$PA_DEV O[addr_cidr]=$PA_CIDR O[addr_brd]=$PA_BRD O[addr_scope]=$PA_SCOPE
+        O[addr_label]=$PA_LABEL O[addr_flags]=${PA_FLAGS//secondary/}
+        O[addr_flags]=${O[addr_flags]//,,/,}
+        O[addr_flags]=${O[addr_flags]#,}
+        O[addr_flags]=${O[addr_flags]%,}
+        save_orig
+    fi
+    if [[ ,$PA_FLAGS, != *,secondary,* ]] && (($(dev_cidrs "$PA_DEV" | wc -l) > 1)); then
+        # Deleting a primary address deletes its secondaries too unless promotion is on.
+        set_sysctl "net/ipv4/conf/$PA_DEV/promote_secondaries" 1 || return 1
+    fi
+    act "remove $PA_CIDR from $PA_DEV (it now lives behind the tunnel)" ip addr del "$PA_CIDR" dev "$PA_DEV"
+    ((DRY)) || persistent_hint
+}
+
+restore_t() {
+    [[ -n ${O[addr_cidr]:-} ]] || return 0
+    local -a args
+    if [[ -z $(addr_line "$T") ]]; then
+        [[ -e /sys/class/net/${O[addr_dev]} ]] || { warn "cannot restore $T: ${O[addr_dev]} no longer exists"; return 1; }
+        args=("${O[addr_cidr]}")
+        [[ -n ${O[addr_brd]:-} ]] && args+=(brd "${O[addr_brd]}")
+        [[ -n ${O[addr_scope]:-} ]] && args+=(scope "${O[addr_scope]}")
+        [[ -n ${O[addr_label]:-} && ${O[addr_label]} != "${O[addr_dev]}" && ${O[addr_label]} == "${O[addr_dev]}"* ]] &&
+            args+=(label "${O[addr_label]}")
+        [[ ,${O[addr_flags]:-}, == *,noprefixroute,* ]] && args+=(noprefixroute)
+        act "restore ${O[addr_cidr]} on ${O[addr_dev]}" ip addr add "${args[@]}" dev "${O[addr_dev]}" || return 1
+    fi
+    unset 'O[addr_dev]' 'O[addr_cidr]' 'O[addr_brd]' 'O[addr_scope]' 'O[addr_label]' 'O[addr_flags]'
+    save_orig
+}
+
+ensure_pneigh() {
+    ip -4 neigh show proxy 2>/dev/null | has "^$(re "$T") dev $(re "$TD")( |$)" && return 0
+    act "proxy-ARP entry: answer ARP for $T on $TD" ip neigh add proxy "$T" dev "$TD"
+}
+
+reconcile_foreign() {
+    local rx_gw rx_bh rx_net='' net
+    set_sysctl "net/ipv4/conf/$TD/forwarding" 1
+    # Inbound traffic for T arrives on $TD from anywhere; strict reverse-path filtering drops
+    # it whenever $TD is not the NIC of the default route.
+    [[ $(sysctl_get "net/ipv4/conf/$TD/rp_filter") == 1 ]] && set_sysctl "net/ipv4/conf/$TD/rp_filter" 2
+    ensure_t_removed
+    ensure_route main "^$(re "$T") dev $(re "$IFN")( |$)" "$T/32" dev "$IFN"
+    rx_gw="^default via $(re "$GW") dev $(re "$TD")( |$)"
+    rx_bh="^blackhole default( |$)"
+    ensure_route "$TM" "$rx_gw" default via "$GW" dev "$TD" onlink
+    if [[ $TMODE == onlink ]]; then
+        net=$(net_of "$T" "$TP")
+        rx_net="^$(re "$net")/$TP dev $(re "$TD")( |$)"
+        ensure_route "$TM" "$rx_net" "$net/$TP" dev "$TD"
+    fi
+    ensure_route "$TM" "$rx_bh" blackhole default metric "$METRIC_LAST"
+    prune_table "$TM" "$rx_gw" "$rx_bh" "$rx_net"
+    ensure_rule $((PRIO + 1)) "from $(re "$T") lookup $TM( |$)" from "$T/32" lookup "$TM"
+    if [[ $TMODE == onlink ]]; then
+        ensure_pneigh
+        set_sysctl "net/ipv4/neigh/$TD/proxy_delay" 0
+    fi
+}
+
+# ---------------------------------------------------------------- local role
+
+add_gw_addr() { ip addr add "$GW/32" dev "$CD" && { O[gw_addr_added]=1; save_orig; }; }
+del_gw_addr() { ip addr del "$GW/32" dev "$CD" 2>/dev/null; unset 'O[gw_addr_added]'; save_orig; }
+ensure_gw_addr() {
+    ip -o -4 addr show dev "$CD" 2>/dev/null | has " inet $(re "$GW")/32 " && return 0
+    act "address $GW/32 on $CD (the router's gateway, gwaddr mode)" add_gw_addr
+}
+
+learned_router_mac() {
+    ip -4 neigh show "$T" dev "$CD" 2>/dev/null |
+        awk '/REACHABLE|STALE|DELAY|PROBE/ && !f { for (i = 1; i < NF; i++) if ($i == "lladdr") { print $(i + 1); f = 1 } }'
+}
+pin_router_mac() { ip neigh replace "$T" lladdr "$1" dev "$CD" nud permanent && { O[router_mac_pinned]=$1; save_orig; }; }
+unpin_router_mac() { ip neigh del "$T" dev "$CD" 2>/dev/null; unset 'O[router_mac_pinned]'; save_orig; }
+ensure_router_mac() {
+    local want=$RMAC cur
+    if [[ $want == off ]]; then
+        [[ -n ${O[router_mac_pinned]:-} ]] && act "unpin router MAC" unpin_router_mac
+        return 0
+    fi
+    if [[ $want == auto ]]; then
+        want=${O[router_mac_pinned]:-$(learned_router_mac)}
+        [[ -n $want ]] || return 0 # the router has not been seen yet
+    fi
+    want=${want,,}
+    cur=$(ip -4 neigh show "$T" dev "$CD" 2>/dev/null)
+    [[ $cur == *"lladdr $want "*PERMANENT* ]] && return 0
+    act "pin router $T at $want on $CD" pin_router_mac "$want"
+}
+
+reconcile_local() {
+    local rx_def rx_bh
+    set_sysctl "net/ipv4/conf/$CD/forwarding" 1
+    if [[ $CAM == gwaddr ]]; then
+        ensure_gw_addr || return 1
+        ensure_route main "^$(re "$T") dev $(re "$CD") .*src $(re "$GW")( |$)" "$T/32" dev "$CD" src "$GW"
+    else
+        ensure_route main "^$(re "$T") dev $(re "$CD")( scope link)?( linkdown)? *$" "$T/32" dev "$CD"
+        set_sysctl "net/ipv4/conf/$CD/proxy_arp" 1
+        set_sysctl "net/ipv4/neigh/$CD/proxy_delay" 0
+    fi
+    rx_def="^default dev $(re "$IFN")( |$)"
+    rx_bh="^blackhole default( |$)"
+    ensure_route "$TM" "$rx_def" default dev "$IFN"
+    ensure_route "$TM" "$rx_bh" blackhole default metric "$METRIC_LAST"
+    prune_table "$TM" "$rx_def" "$rx_bh"
+    ensure_rule $((PRIO + 1)) "from $(re "$T") iif $(re "$CD")( \[detached\])? lookup $TM( |$)" from "$T/32" iif "$CD" lookup "$TM"
+    ensure_router_mac
+}
+
+# ---------------------------------------------------------------- reconcile / remove
+
+reconcile_once() {
+    ensure_module
+    set_sysctl net/ipv4/ip_forward 1
+    ensure_pin
+    ensure_tunnel "$MTU"
+    if [[ $ROLE == foreign ]]; then reconcile_foreign; else reconcile_local; fi
+    ensure_iptables
+}
+
+# Compute drift without changing anything.
+check_drift() {
+    DRY=1 DRIFT=()
+    reconcile_once >/dev/null 2>&1
+    DRY=0
+}
+
+remove_all() {
+    local p t cur odev=${O[addr_dev]:-}
+    ipt_remove_all
+    for ((p = PRIO; p < PRIO + 10; p++)); do
+        cur=$(rule_lines "$p")
+        [[ -n $cur ]] || continue
+        if rules_ours "$cur"; then act "remove rule $p" del_rules_pref "$p"; else warn "ip rule priority $p is not ours; left alone"; fi
+    done
+    for t in "$TM" "$TPN" "$TT"; do
+        [[ -n $(ip -4 route show table "$t" 2>/dev/null) ]] && act "flush routing table $t (owned by $NAME)" ip -4 route flush table "$t"
+    done
+    if ip -4 route show table main proto "$RT_PROTO" 2>/dev/null | has "^$(re "$T") "; then
+        act "remove route $T/32" ip -4 route del "$T/32" table main proto "$RT_PROTO"
+    fi
+    if [[ $ROLE == foreign ]]; then
+        ip -4 neigh show proxy 2>/dev/null | has "^$(re "$T") dev $(re "$TD")( |$)" &&
+            act "remove proxy-ARP entry for $T on $TD" ip neigh del proxy "$T" dev "$TD"
+    else
+        [[ -n ${O[router_mac_pinned]:-} ]] && act "unpin router MAC" unpin_router_mac
+        [[ ${O[gw_addr_added]:-} == 1 ]] && act "remove $GW/32 from $CD" del_gw_addr
+    fi
+    if [[ -e /sys/class/net/$IFN ]]; then
+        if tun_owned; then act "delete $IFN" ip link del dev "$IFN"; else warn "$IFN exists but is not ours; left alone"; fi
+    fi
+    if [[ $ROLE == foreign ]]; then
+        restore_t
+        restore_dev_sysctls "$TD"
+        [[ -n $odev && $odev != "$TD" ]] && restore_dev_sysctls "$odev"
+    else
+        restore_dev_sysctls "$CD"
+    fi
+}
+
+# ---------------------------------------------------------------- create
+
+parse_create_flags() {
+    local k v
+    while (($#)); do
+        case $1 in
+            --*=*) k=${1%%=*} v=${1#*=}; shift ;;
+            --*) k=$1; [[ $# -ge 2 ]] || die "$1 needs a value"; v=$2; shift 2 ;;
+            *) die "unexpected argument '$1'" ;;
+        esac
+        k=${k#--}
+        [[ $FLAG_KEYS == *" $k "* ]] || die "unknown option --$k"
+        [[ $v =~ $VALUE_RE && -n $v ]] || die "invalid value for --$k"
+        F[$k]=$v
+    done
+}
+
+# ask <flag> <prompt> <default> <validator>: flag value if given (validated), else prompt.
+ask() {
+    local key=$1 prompt=$2 def=$3 vfn=$4 val
+    if [[ -n ${F[$key]+x} ]]; then
+        val=${F[$key]}
+        $vfn "$val" || die "invalid --$key '$val'"
+        printf '%s' "$val"
+        return 0
+    fi
+    while :; do
+        read -r -p "  $prompt${def:+ [$def]}: " val </dev/tty || die "no terminal to prompt on; pass --$key"
+        val=${val:-$def}
+        if [[ -n $val && $val =~ $VALUE_RE ]] && $vfn "$val"; then
+            printf '%s' "$val"
+            return 0
+        fi
+        printf '  invalid value, try again\n' >/dev/tty
+    done
+}
+confirm() {
+    local a
+    read -r -p "$1 [y/N] " a </dev/tty || return 1
+    [[ ${a,,} == y || ${a,,} == yes ]]
+}
+
+derive_key() { # same result on both hosts: name plus the unordered endpoint pair
+    local a b h
+    a=$(ip2int "$2") b=$(ip2int "$3")
+    ((a > b)) && { h=$a; a=$b; b=$h; }
+    h=$(printf '%s|%s|%s' "$1" "$a" "$b" | cksum | awk '{print $1}')
+    echo $((h % 4294967295 + 1))
+}
+subnet_free() { # subnet_free <network> : no host address and no other tunnel inside n/30
+    local n=$1 c x
+    for c in $(ip -o -4 addr show 2>/dev/null | awk '{split($4, a, "/"); print a[1]}'); do
+        in_net "$c" "$n" 30 && return 1
+    done
+    local -A X
+    while read -r x; do
+        X=()
+        read_kv "$CONF_DIR/$x.conf" "$CONF_KEYS" X
+        in_net "${X[tunnel_local]}" "$n" 30 && return 1
+    done < <(tunnel_names)
+    return 0
+}
+derive_subnet() {
+    local k=$1 i h n
+    for ((i = 0; i < 64; i++)); do
+        h=$(((k + i * 7919) & 0xFFFF))
+        n="10.231.$((h >> 8)).$(((h & 0x3F) * 4))"
+        subnet_free "$n" && { echo "$(int2ip $(($(ip2int "$n") + 1))),$(int2ip $(($(ip2int "$n") + 2)))"; return 0; }
+    done
+}
+detect_egw() {
+    local g c
+    g=$(dev_gw "$1")
+    [[ -n $g ]] && { echo "$g"; return 0; }
+    for c in $(dev_cidrs "$1"); do
+        in_net "$2" "${c%/*}" "${c#*/}" && { echo none; return 0; }
+    done
+}
+detect_prefix() { # prefix of T from its address, else from the device's subnet that contains it
+    local line c
+    line=$(addr_line "$1")
+    if [[ -n $line ]]; then parse_addr_line "$line" && echo "${PA_CIDR#*/}" && return 0; fi
+    for c in $(dev_cidrs "$2"); do
+        in_net "$1" "${c%/*}" "${c#*/}" && { echo "${c#*/}"; return 0; }
+    done
+}
+client_candidates() {
+    local d
+    for d in /sys/class/net/*; do
+        d=${d##*/}
+        [[ $d == lo || $d == "$EG" || $d == "$IF_PREFIX"* ]] && continue
+        ip -4 route show default 2>/dev/null | has "dev $(re "$d")( |$)" && continue
+        printf '    %-15s %s %s\n' "$d" "$(cat "/sys/class/net/$d/operstate" 2>/dev/null)" "$(dev_cidrs "$d" | tr '\n' ' ')"
+    done
+}
+
+used_tables() {
+    {
+        cat /etc/iproute2/rt_tables /etc/iproute2/rt_tables.d/*.conf \
+            /usr/share/iproute2/rt_tables /usr/share/iproute2/rt_tables.d/*.conf 2>/dev/null |
+            awk '$1 ~ /^[0-9]+$/ {print $1}'
+        ip -4 rule show 2>/dev/null | grep -oE 'lookup [0-9]+' | awk '{print $2}'
+        ip -4 route show table all 2>/dev/null | grep -oE 'table [0-9]+' | awk '{print $2}'
+    } | sort -un
+}
+allocate() {
+    local i j tm pr ut up f
+    local -A taken=() Y
+    ut=" $(used_tables | tr '\n' ' ') "
+    up=" $(ip -4 rule show 2>/dev/null | awk -F: '{print $1}' | tr '\n' ' ') "
+    for f in "$STATE_DIR"/*/alloc; do
+        [[ -e $f ]] || continue
+        Y=()
+        read_kv "$f" "$ALLOC_KEYS" Y
+        taken[${Y[idx]:-x}]=1
+    done
+    for ((i = 0; i < MAX_TUNNELS; i++)); do
+        [[ -n ${taken[$i]:-} ]] && continue
+        tm=$((TABLE_BASE + 3 * i)) pr=$((PRIO_BASE + 10 * i))
+        for ((j = 0; j < 3; j++)); do [[ $ut == *" $((tm + j)) "* ]] && continue 2; done
+        for ((j = 0; j < 10; j++)); do [[ $up == *" $((pr + j)) "* ]] && continue 2; done
+        A=([idx]=$i [ifname]=$IF_PREFIX$NAME [table_main]=$tm [table_pin]=$((tm + 1)) [table_test]=$((tm + 2)) [prio]=$pr)
+        return 0
+    done
+    die "no free routing-table / rule-priority block left"
+}
+
+collision_check() {
+    local n line krx
+    local -A X
+    [[ -e /sys/class/net/$IFN ]] && die "interface $IFN already exists"
+    while read -r n; do
+        [[ $n == "$NAME" ]] && continue
+        X=()
+        read_kv "$CONF_DIR/$n.conf" "$CONF_KEYS" X
+        [[ ${X[transported_ip]:-} == "$T" ]] && die "$T is already carried by tunnel '$n'"
+        [[ ${X[local_public]:-} == "$L" && ${X[remote_public]:-} == "$R" && ${X[gre_key]:-} == "$KEY" ]] &&
+            die "tunnel '$n' already uses $L -> $R with key $KEY; pick another --gre-key"
+        for line in "${X[tunnel_local]:-}" "${X[tunnel_remote]:-}"; do
+            [[ $line == "$TL" || $line == "$TR" ]] && die "tunnel address $line is already used by tunnel '$n'"
+        done
+    done < <(tunnel_names)
+    krx="key ($KEY|$(re "$(int2ip "$KEY")"))([[:space:]]|$)"
+    while IFS= read -r line; do
+        [[ $line == *"link/gre $L peer $R "* && $line =~ $krx ]] &&
+            die "a GRE tunnel with $L -> $R key $KEY already exists: ${line%%:*}"
+    done < <(ip -d -o link show type gre 2>/dev/null)
+    for line in "$TL" "$TR"; do
+        [[ -n $(dev_of_addr "$line") ]] && die "tunnel address $line is already configured on this host"
+    done
+    return 0
+}
+
+print_peer_cmd() {
+    local other=foreign sf=$TR sl=$TL
+    [[ $ROLE == foreign ]] && other=local sf=$TL sl=$TR
+    hdr "On the peer ($R), create the matching $other side with:"
+    printf '  %s create --role %s --name %s \\\n' "$PROG" "$other" "$NAME"
+    printf '      --local-public %s --remote-public %s \\\n' "$R" "$L"
+    printf '      --tunnel-subnet %s,%s --gre-key %s --mtu %s \\\n' "$sf" "$sl" "$KEY" "$MTU"
+    printf '      --transported-ip %s --transported-gw %s --transported-mask %s\n' "$T" "$GW" "$TP"
+    say "  It still asks for its own NICs and shows everything for confirmation."
+}
+
+cmd_create() {
+    need_root
+    parse_create_flags "$@"
+    [[ -d $CONF_DIR && -d $STATE_DIR ]] || die "run '$PROG install' first"
+    local role name lp rp eg egw key sub sf sl mtu t td m tgw tmode cd='' cam='' rmac='' d
+    hdr "New tunnel  (values in [brackets] were auto-detected; Enter accepts them)"
+    role=$(ask role "role: foreign (owns the public IP) or local (faces the client router)" "" is_role) || exit 1
+    name=$(ask name "tunnel name (a-z 0-9 -, max 10 chars, unused)" "" is_new_name) || exit 1
+    rp=$(ask remote-public "peer's tunnel address" "" is_unicast) || exit 1
+    d=''
+    [[ -n ${F[egress-dev]:-} ]] && is_dev "${F[egress-dev]}" && d=$(dev_addrs "${F[egress-dev]}" | awk 'NR == 1')
+    [[ -n $d ]] || d=$(route_field src "$rp")
+    lp=$(ask local-public "this host's tunnel source address" "$d" is_local_addr) || exit 1
+    eg=$(ask egress-dev "NIC the tunnel must leave through (pinned)" "$(dev_of_addr "$lp")" is_dev) || exit 1
+    egw=$(ask egress-gw "next hop on $eg toward $rp ('none' if on-link)" "$(detect_egw "$eg" "$rp")" is_gw_or_none) || exit 1
+    key=$(ask gre-key "GRE key (must match on both hosts)" "$(derive_key "$name" "$lp" "$rp")" is_key) || exit 1
+    sub=$(ask tunnel-subnet "GRE link addresses: a /30 or FOREIGN_IP,LOCAL_IP" "$(derive_subnet "$key")" is_subnet) || exit 1
+    read -r sf sl <<<"$(parse_subnet "$sub")"
+    d=$(dev_mtu "$eg")
+    mtu=$(ask mtu "tunnel MTU (egress MTU $d - $GRE_OVERHEAD)" "$((d - GRE_OVERHEAD))" is_mtu) || exit 1
+
+    if [[ $role == foreign ]]; then
+        t=$(ask transported-ip "public IP to carry to the router" "" is_unicast) || exit 1
+        d=$(dev_of_addr "$t")
+        td=$(ask transported-dev "NIC on the provider segment where $t lives" "${d:-$eg}" is_dev) || exit 1
+        m=$(ask transported-mask "netmask the router will use for $t" "$(detect_prefix "$t" "$td")" is_mask) || exit 1
+        m=$(mask2pfx "$m")
+        d=$(dev_gw "$td")
+        [[ -n $d ]] && ! in_net "$d" "$t" "$m" && d=''
+        tgw=$(ask transported-gw "$t's real provider gateway" "$d" is_unicast) || exit 1
+        d=routed
+        [[ -n $(addr_line "$t") || -n $(detect_prefix "$t" "$td") ]] && d=onlink
+        tmode=$(ask transported-mode "onlink (provider ARPs for it: proxy ARP) or routed (provider routes it to this host)" "$d" is_tmode) || exit 1
+    else
+        EG=$eg
+        printf '  candidate client NICs (no default route):\n%s\n' "$(client_candidates)" >&2
+        cd=$(ask client-dev "NIC facing the client router" "" is_dev) || exit 1
+        t=$(ask transported-ip "public IP the router will use" "" is_unicast) || exit 1
+        m=$(ask transported-mask "its netmask" "" is_mask) || exit 1
+        m=$(mask2pfx "$m")
+        tgw=$(ask transported-gw "its real provider gateway" "" is_unicast) || exit 1
+        cam=$(ask client-arp-mode "answer the router's ARP for the gateway with: proxy | gwaddr" proxy is_cam) || exit 1
+        rmac=$(ask router-mac "pin the router's MAC: off | auto | xx:xx:xx:xx:xx:xx" off is_rmac) || exit 1
+    fi
+
+    C=([name]=$name [role]=$role [local_public]=$lp [remote_public]=$rp [egress_dev]=$eg [egress_gw]=$egw
+        [gre_key]=$((10#$key)) [mtu]=$((10#$mtu)) [transported_ip]=$t [transported_gw]=$tgw [transported_prefix]=$m)
+    if [[ $role == foreign ]]; then
+        C[tunnel_local]=$sf C[tunnel_remote]=$sl C[transported_dev]=$td C[transported_mode]=$tmode
+    else
+        C[tunnel_local]=$sl C[tunnel_remote]=$sf C[client_dev]=$cd C[client_arp_mode]=$cam C[router_mac]=${rmac,,}
+    fi
+    validate_conf
+    apply_conf
+    runtime_check
+    collision_check
+    mgmt_check
+
+    hdr "Summary for tunnel '$NAME' ($ROLE)"
+    kv "GRE" "$L -> $R  key $KEY  interface $IFN"
+    kv "pinned egress" "$EG via ${EGW/none/direct (on-link)}"
+    kv "link addresses" "$TL (here) <-> $TR (peer)"
+    kv "MTU / MSS" "$MTU / $((MTU - 40))"
+    kv "transported IP" "$T/$TP  gateway $GW"
+    if [[ $ROLE == foreign ]]; then
+        kv "provider NIC" "$TD  ($TMODE)"
+        [[ -n $(addr_line "$T") ]] && kv "note" "$T will be removed from $(dev_of_addr "$T") on 'up' and restored on 'down'"
+    else
+        kv "client NIC" "$CD  (ARP mode $CAM, router MAC pin $RMAC)"
+    fi
+    persistent_hint
+    say
+    confirm "Write $CONF_DIR/$NAME.conf?" || die "aborted; nothing written"
+
+    lock
+    allocate
+    mkdir -p "$STATE_DIR/$NAME" && chmod 700 "$STATE_DIR/$NAME"
+    write_kv "$CONF_DIR/$NAME.conf" C
+    write_kv "$STATE_DIR/$NAME/alloc" A
+    unlock
+    ok "saved $CONF_DIR/$NAME.conf (tables ${A[table_main]}-${A[table_test]}, rule priorities ${A[prio]}+)"
+    print_peer_cmd
+    hdr "Next steps"
+    say "  1. On BOTH hosts at the same time:   $PROG test $NAME --preflight"
+    say "  2. On both hosts:                    $PROG up $NAME"
+    say "  3. On the router WAN:                address $T/$TP, gateway $GW, MTU $MTU"
+    say "  4. Verify:                           $PROG test $NAME"
+}
+
+# ---------------------------------------------------------------- up / down / teardown / reconcile
+
+need_unit() { [[ -f $UNIT_PATH && -x $BIN_PATH ]] || die "service not installed; run '$PROG install' first"; }
+
+cmd_up() {
+    [[ $# -eq 1 ]] || die "usage: $PROG up <name>"
+    need_root
+    need_unit
+    load_tunnel "$1"
+    runtime_check
+    mgmt_check
+    lock
+    hdr "Bringing up $NAME ($ROLE)"
+    CHANGES=0
+    reconcile_once
+    unlock
+    ((CHANGES == 0)) && say "  already in the desired state; nothing changed"
+    systemctl enable "pubgre@$NAME" >/dev/null 2>&1 || warn "could not enable pubgre@$NAME"
+    systemctl restart "pubgre@$NAME" || warn "could not start pubgre@$NAME"
+    ok "service pubgre@$NAME enabled (reconciles every ${LOOP_INTERVAL}s, survives reboot)"
+    [[ $ROLE == local ]] && say "  Router WAN: $T/$TP gateway $GW, MTU $MTU (or leave 1500: MSS is clamped for TCP)"
+}
+
+cmd_down() {
+    [[ $# -eq 1 ]] || die "usage: $PROG down <name>"
+    need_root
+    load_tunnel "$1"
+    systemctl disable --now "pubgre@$NAME" >/dev/null 2>&1
+    lock
+    hdr "Taking down $NAME ($ROLE)"
+    CHANGES=0
+    remove_all
+    unlock
+    ((CHANGES == 0)) && say "  nothing to remove"
+    ok "$NAME is down; config kept in $CONF_DIR/$NAME.conf"
+}
+
+cmd_teardown() {
+    local name='' yes=0 rest
+    while (($#)); do
+        case $1 in
+            --yes) yes=1 ;;
+            -*) die "unknown option $1" ;;
+            *) [[ -z $name ]] || die "unexpected argument $1"; name=$1 ;;
+        esac
+        shift
+    done
+    [[ -n $name ]] || die "usage: $PROG teardown <name> [--yes]"
+    need_root
+    load_tunnel "$name"
+    ((yes)) || confirm "Remove tunnel '$NAME' completely (rules, routes, interface, config, state)?" || die "aborted"
+    systemctl disable --now "pubgre@$NAME" >/dev/null 2>&1
+    lock
+    hdr "Tearing down $NAME ($ROLE)"
+    remove_all
+    rm -f -- "$CONF_DIR/$NAME.conf"
+    [[ -d $STATE_DIR/$NAME ]] && rm -rf -- "${STATE_DIR:?}/$NAME"
+    rest=$(tunnel_names)
+    if [[ -z $rest ]]; then
+        restore_sysctls '.' # last tunnel gone: put back everything, including ip_forward
+    fi
+    unlock
+    ok "tunnel $NAME removed"
+}
+
+cmd_reconcile() {
+    local name='' loop=0 check=0
+    while (($#)); do
+        case $1 in
+            --loop) is_port "${2:-}" || die "--loop needs seconds"; loop=$((10#$2)); shift ;;
+            --check) check=1 ;;
+            -*) die "unknown option $1" ;;
+            *) [[ -z $name ]] || die "unexpected argument $1"; name=$1 ;;
+        esac
+        shift
+    done
+    [[ -n $name ]] || die "usage: $PROG reconcile <name> [--loop SECONDS | --check]"
+    need_root
+    if ((check)); then
+        load_tunnel "$name"
+        check_drift
+        if ((${#DRIFT[@]})); then printf '  drift: %s\n' "${DRIFT[@]}"; exit 1; fi
+        say "  in sync"
+        return 0
+    fi
+    if ((loop == 0)); then
+        load_tunnel "$name"
+        lock
+        reconcile_once
+        unlock
+        return 0
+    fi
+    trap 'exit 0' TERM INT
+    say "pubgre $VERSION: reconciling $name every ${loop}s"
+    while :; do
+        load_tunnel "$name" # re-read each pass so config edits take effect
+        lock
+        CHANGES=0
+        reconcile_once
+        unlock
+        sleep "$loop" &
+        wait $!
+    done
+}
+
+# ---------------------------------------------------------------- probes
+
+tcp_probe() { # tcp_probe <src> <dst> <port> -> open | refused | timeout | unreachable | unavailable
+    local out
+    if command -v python3 >/dev/null; then
+        python3 -I - "$1" "$2" "$3" 2>/dev/null <<'PY' && return 0
+import errno, socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(4)
+try:
+    s.bind((sys.argv[1], 0))
+    r = s.connect_ex((sys.argv[2], int(sys.argv[3])))
+except socket.timeout:
+    r = errno.ETIMEDOUT
+except OSError as e:
+    r = e.errno
+if r == 0:
+    print("open")
+elif r == errno.ECONNREFUSED:
+    print("refused")
+elif r in (errno.EHOSTUNREACH, errno.ENETUNREACH):
+    print("unreachable")
+else:
+    print("timeout")
+PY
+    fi
+    if command -v nc >/dev/null; then
+        out=$(timeout 6 nc -z -v -w 4 -s "$1" "$2" "$3" 2>&1)
+        case $out in
+            *succeeded* | *open* | *Connected*) echo open ;;
+            *refused*) echo refused ;;
+            *unreachable*) echo unreachable ;;
+            *) echo timeout ;;
+        esac
+        return 0
+    fi
+    echo unavailable
+}
+tcp_verdict() { # tcp_verdict <result> <port>
+    case $1 in
+        open) ok "TCP $2 on the router accepted the connection" ;;
+        refused) ok "router answered TCP $2 with a reset (port closed, but the SYN reached the router and its answer came back)" ;;
+        timeout) note "no answer on TCP $2; the router's firewall may drop it. Try --port with a port the router serves" ;;
+        unreachable) bad "TCP $2: destination unreachable" ;;
+        *) note "TCP probe skipped (needs python3 or nc)" ;;
+    esac
+}
+
+probe_pmtu() { # largest packet src->dst with DF set; 0 if the peer does not answer ping
+    local src=$1 dst=$2 lo=548 hi=$(($3 - 28)) mid
+    ping -n -c2 -i 0.2 -W1 -M do -I "$src" -s "$lo" "$dst" >/dev/null 2>&1 || { echo 0; return 0; }
+    while ((lo < hi)); do
+        mid=$(((lo + hi + 1) / 2))
+        if ping -n -c2 -i 0.2 -W1 -M do -I "$src" -s "$mid" "$dst" >/dev/null 2>&1; then lo=$mid; else hi=$((mid - 1)); fi
+    done
+    echo $((lo + 28))
+}
+
+hairpin_up() { # route S -> T out to the provider gateway so the packet comes back in like outside traffic
+    HP_OLD=$(sysctl_get "net/ipv4/conf/$TD/accept_local")
+    HP_ACTIVE=1
+    sysctl_put "net/ipv4/conf/$TD/accept_local" 1
+    # "iif lo" limits the rule to our own probe; the copy coming back in on $TD must take
+    # the normal path into the tunnel instead of being bounced to the gateway again.
+    ip -4 route replace "$T/32" via "$GW" dev "$TD" onlink table "$TT" proto "$RT_PROTO" &&
+        ip -4 rule add pref $((PRIO + 5)) from "$1/32" to "$T/32" iif lo lookup "$TT"
+}
+hairpin_down() {
+    ((HP_ACTIVE)) || return 0
+    HP_ACTIVE=0
+    del_rules_pref $((PRIO + 5)) 2>/dev/null
+    ip -4 route flush table "$TT" 2>/dev/null
+    [[ -n $HP_OLD ]] && sysctl_put "net/ipv4/conf/$TD/accept_local" "$HP_OLD"
+}
+preflight_cleanup() {
+    ((PF_ACTIVE)) || return 0
+    PF_ACTIVE=0
+    DRY=0
+    ipt_remove_all >/dev/null 2>&1
+    [[ -n $(rule_lines "$PRIO") ]] && rules_ours "$(rule_lines "$PRIO")" && del_rules_pref "$PRIO"
+    ip -4 route flush table "$TPN" 2>/dev/null
+    [[ -e /sys/class/net/$IFN ]] && tun_owned && ip link del dev "$IFN"
+}
+cleanup() {
+    hairpin_down
+    preflight_cleanup
+    [[ -n $TCPDUMP_PID ]] && kill "$TCPDUMP_PID" 2>/dev/null
+    [[ -n $TMP_FILE ]] && rm -f -- "$TMP_FILE"
+    return 0
+}
+
+# ---------------------------------------------------------------- preflight
+
+preflight() {
+    local dur=$1 emtu tmtu pmtu sent=0 got=0 gre=0 good=0 start c i n alts=() rc=1
+    [[ -e /sys/class/net/$IFN ]] && die "$IFN exists. Preflight runs before 'up'; use '$PROG test $NAME' for a live tunnel, or '$PROG down $NAME' first."
+    is_dev "$EG" || die "egress device $EG does not exist"
+    [[ $(dev_of_addr "$L") == "$EG" ]] || die "$L is not configured on $EG"
+    mgmt_check
+    emtu=$(dev_mtu "$EG")
+    tmtu=$((emtu - GRE_OVERHEAD))
+    hdr "Preflight $NAME ($ROLE): GRE $L -> $R key $KEY, pinned to $EG"
+    say "  Run '$PROG test $NAME --preflight' on the peer now. This side keeps sending for up to ${dur}s."
+    PF_ACTIVE=1
+    ensure_module >/dev/null
+    ensure_pin >/dev/null
+    ensure_tunnel "$tmtu" >/dev/null || die "could not create the temporary tunnel"
+    ipt -t filter -I INPUT 1 -i "$EG" -s "$R/32" -d "$L/32" -p 47 -m comment --comment "$(ipt_tag pf-gre)" -j ACCEPT
+    i=0
+    for c in $(dev_addrs "$EG"); do
+        [[ $c == "$L" ]] && continue
+        ipt -t filter -I INPUT 1 -i "$EG" -s "$R/32" -d "$c/32" -p 47 -m comment --comment "$(ipt_tag "pf-alt$i")"
+        alts[i]=$c
+        i=$((i + 1))
+    done
+    ipt -t filter -I INPUT 1 -i "$EG" ! -s "$R/32" -p 47 -m comment --comment "$(ipt_tag pf-other)"
+
+    printf '  probing path MTU to %s ... ' "$R"
+    pmtu=$(probe_pmtu "$L" "$R" "$emtu")
+    if ((pmtu > 0)); then say "$pmtu"; else say "unknown (peer does not answer ping)"; fi
+
+    start=$SECONDS
+    while ((SECONDS - start < dur)); do
+        sent=$((sent + 1))
+        if ping -n -c1 -W1 "$TR" >/dev/null 2>&1; then
+            got=$((got + 1))
+            sleep 1
+        fi
+        gre=$(ipt_count filter pf-gre)
+        gre=${gre:-0}
+        printf '\r  %3ss  echo sent %-3s replies %-3s GRE packets from peer %-6s' $((SECONDS - start)) "$sent" "$got" "$gre"
+        if ((got >= 3 && gre >= 3)); then
+            good=$((good + 1))
+            ((good >= 5)) && break # keep sending a little so the peer sees us too
+        fi
+    done
+    say
+
+    hdr "Result on this host ($L)"
+    if ((gre > 0)); then
+        ok "GRE $R -> $L arrives here ($gre packets): direction peer -> this host works"
+    else
+        bad "no GRE from $R reached $L"
+    fi
+    for ((i = 0; i < ${#alts[@]}; i++)); do
+        n=$(ipt_count filter "pf-alt$i")
+        ((${n:-0} > 0)) && note "$n GRE packets from $R arrived at ${alts[i]} instead: the peer's --remote-public should be $L (or use ${alts[i]} here)"
+    done
+    n=$(ipt_count filter pf-other)
+    ((${n:-0} > 0)) && note "$n GRE packets arrived from addresses other than $R: the peer may be sending from a different source IP"
+    if ((got > 0)); then
+        ok "$got/$sent echo replies through the tunnel: direction this host -> peer works too"
+        if ping -n -c3 -W1 -M do -s $((MTU - 28)) "$TR" >/dev/null 2>&1; then
+            ok "full-size packets for the configured MTU ($MTU) pass with DF set"
+        else
+            bad "packets of the configured MTU ($MTU) do not pass with DF set; lower mtu= in $CONF_DIR/$NAME.conf on both hosts"
+        fi
+        rc=0
+    elif ((gre > 0)); then
+        bad "no echo replies. Either GRE $L -> $R is dropped, or the peer was not running its preflight / drops ICMP on its tunnel."
+        say "         Read the peer's report: if it says 'no GRE from $L reached $R', the direction $L -> $R is filtered."
+    else
+        bad "nothing from the peer and no replies. Either the peer's preflight was not running in this window, or GRE is filtered both ways."
+        say "         Re-run on both hosts together. If the peer then sees GRE and this host does not, $R -> $L is filtered."
+    fi
+    if ((pmtu > 0)); then
+        if ((pmtu - GRE_OVERHEAD < MTU)); then
+            bad "path MTU $pmtu allows a tunnel MTU of at most $((pmtu - GRE_OVERHEAD)); configured $MTU. Set mtu=$((pmtu - GRE_OVERHEAD)) on both hosts."
+        else
+            ok "path MTU $pmtu fits the configured tunnel MTU $MTU (+$GRE_OVERHEAD bytes GRE overhead)"
+        fi
+    fi
+    if ((rc)) && [[ -n $(dev_addrs "$EG" | grep -vxF "$L") ]]; then
+        note "providers sometimes filter GRE per source address. Other addresses on $EG: $(dev_addrs "$EG" | grep -vxF "$L" | tr '\n' ' ')"
+    fi
+    return "$rc"
+}
+
+# ---------------------------------------------------------------- live test
+
+live_test() {
+    local port=$1 fails=0 n dec s b1 a1 pr tcp req rep
+    [[ -e /sys/class/net/$IFN ]] || die "$IFN does not exist; run '$PROG up $NAME' (or 'test $NAME --preflight' before bringing it up)"
+    hdr "Tunnel $IFN"
+    if ping -n -c3 -W2 "$TR" >/dev/null 2>&1; then ok "peer link address $TR answers"; else bad "no reply from $TR through $IFN"; fails=$((fails + 1)); fi
+    if ping -n -c2 -W2 -M do -s $((MTU - 28)) "$TR" >/dev/null 2>&1; then
+        ok "$MTU-byte packets pass with DF set"
+    else
+        bad "$MTU-byte packets with DF set do not pass; the path MTU is lower than mtu=$MTU"
+        fails=$((fails + 1))
+    fi
+
+    if [[ $ROLE == foreign ]]; then
+        hdr "ARP on the provider segment ($TD)"
+        [[ -z $(addr_line "$T") ]] && ok "$T is not configured locally" || { bad "$T is still configured on this host"; fails=$((fails + 1)); }
+        if [[ $TMODE == onlink ]]; then
+            if ip -4 neigh show proxy 2>/dev/null | has "^$(re "$T") dev $(re "$TD")( |$)"; then
+                ok "proxy entry present: this host answers ARP for $T on $TD"
+            else
+                bad "proxy entry for $T on $TD missing"; fails=$((fails + 1))
+            fi
+        fi
+        dec=$(route_field dev "$T" from "$GW" iif "$TD")
+        if [[ $dec == "$IFN" ]]; then ok "kernel routes $T (asked by $GW on $TD) into $IFN, so it will answer"; else bad "kernel routes $T to '${dec:-nothing}', not $IFN: no proxy reply"; fails=$((fails + 1)); fi
+        n=$(ip -4 neigh show "$GW" dev "$TD" 2>/dev/null)
+        if [[ $n == *lladdr* ]]; then ok "provider gateway resolved: $n"; else bad "provider gateway $GW is not resolved on $TD"; fails=$((fails + 1)); fi
+
+        hdr "Inbound path: provider gateway -> proxy ARP -> tunnel -> router"
+        s=$(dev_addrs "$TD" | grep -vxF "$T" | awk 'NR == 1')
+        if [[ -z $s ]]; then
+            note "no other address on $TD to hairpin from; from any outside machine run: ping $T"
+        else
+            b1=$(ipt_count filter fwd-in)
+            if command -v tcpdump >/dev/null; then
+                TMP_FILE=$(mktemp)
+                timeout 14 tcpdump -lnni "$TD" -c 40 "arp and host $T" >"$TMP_FILE" 2>/dev/null &
+                TCPDUMP_PID=$!
+                sleep 1
+            fi
+            hairpin_up "$s" || note "could not install the hairpin route"
+            pr=bad
+            ping -n -c4 -W2 -I "$s" "$T" >/dev/null 2>&1 && pr=ok
+            tcp=$(tcp_probe "$s" "$T" "$port")
+            hairpin_down
+            a1=$(ipt_count filter fwd-in)
+            if [[ -n $TCPDUMP_PID ]]; then
+                sleep 1
+                kill "$TCPDUMP_PID" 2>/dev/null
+                wait "$TCPDUMP_PID" 2>/dev/null
+                TCPDUMP_PID=''
+            fi
+            n=$((${a1:-0} - ${b1:-0}))
+            say "  probes sent from $s to $T via $GW; $n came back in from the provider and entered the tunnel"
+            if [[ $pr == ok ]]; then
+                ok "the router answered pings to $T arriving from the Internet side: inbound works end to end"
+            elif ((n > 0)); then
+                bad "packets for $T reach the tunnel but no ping reply came back: check the local side ('$PROG test $NAME' there) and the router's ICMP policy"
+                fails=$((fails + 1))
+            fi
+            tcp_verdict "$tcp" "$port"
+            if ((n == 0)); then
+                if [[ -n $TMP_FILE && -s $TMP_FILE ]]; then
+                    req=$(grep -c "Request who-has $T " "$TMP_FILE") rep=$(grep -c "Reply $T is-at" "$TMP_FILE")
+                    if ((req > 0 && rep > 0)); then
+                        bad "the gateway asks for $T and this host answers, but packets never arrive: the provider is filtering proxied addresses (port security / IP-MAC binding)"
+                    elif ((req > 0)); then
+                        bad "the gateway asks for $T and this host does NOT answer: check forwarding, the proxy entry and the route above"
+                    else
+                        note "the gateway did not send our probe back (no ARP, no packets). Many gateways refuse to hairpin. Ask someone outside to: ping $T"
+                    fi
+                else
+                    note "nothing came back. The gateway may refuse to hairpin, or proxied addresses are filtered. Install tcpdump for a precise diagnosis, or ping $T from outside."
+                fi
+                fails=$((fails + 1))
+            fi
+        fi
+        hdr "Router evidence"
+        n=$(ipt_count filter fwd-out)
+        if ((${n:-0} > 0)); then ok "$n packets from the router left via $TD with source $T (the local side answers its ARP for $GW)"; else note "no packets from the router have left via this host yet"; fi
+    else
+        hdr "ARP on the client link ($CD)"
+        if [[ $CAM == proxy ]]; then
+            [[ $(sysctl_get "net/ipv4/conf/$CD/proxy_arp") == 1 ]] && ok "proxy_arp=1 on $CD" || { bad "proxy_arp is off on $CD"; fails=$((fails + 1)); }
+            dec=$(route_field dev "$GW" from "$T" iif "$CD")
+            if [[ $dec == "$IFN" ]]; then ok "kernel routes $GW (asked by $T on $CD) into $IFN, so it answers the router's ARP"; else bad "kernel routes $GW to '${dec:-nothing}': the router's ARP for its gateway gets no reply"; fails=$((fails + 1)); fi
+        else
+            ip -o -4 addr show dev "$CD" | has " inet $(re "$GW")/32 " && ok "$GW/32 is on $CD (gwaddr mode)" || { bad "$GW/32 missing on $CD"; fails=$((fails + 1)); }
+        fi
+        n=$(ip -4 neigh show "$T" dev "$CD" 2>/dev/null)
+        if [[ $n == *lladdr* ]]; then ok "router seen: $n"; else bad "no ARP entry for the router ($T) on $CD: check cabling and the router's WAN address"; fails=$((fails + 1)); fi
+
+        hdr "Round trip to the router"
+        pr=bad
+        ping -n -c4 -W2 -I "$TL" "$T" >/dev/null 2>&1 && pr=ok
+        tcp=$(tcp_probe "$TL" "$T" "$port")
+        if [[ $pr == ok ]]; then
+            ok "router answered from $T; its reply went via its gateway $GW, so its ARP for the gateway is answered here"
+        else
+            bad "the router did not answer ping. Check its WAN config ($T/$TP gw $GW), its ICMP policy and the ARP lines above"
+            fails=$((fails + 1))
+        fi
+        tcp_verdict "$tcp" "$port"
+        hdr "Inbound evidence"
+        n=$(ipt_count filter fwd-in)
+        if ((${n:-0} > 0)); then ok "$n packets for $T arrived from the tunnel and went to the router"; else note "nothing has arrived for $T from the tunnel yet; run '$PROG test $NAME' on the foreign host"; fi
+    fi
+    say
+    if ((fails == 0)); then ok "all checks passed"; else bad "$fails check(s) failed"; fi
+    ((fails == 0))
+}
+
+cmd_test() {
+    local name='' pre=0 dur=45 port=80
+    while (($#)); do
+        case $1 in
+            --preflight) pre=1 ;;
+            --duration) [[ ${2:-} =~ ^[0-9]{1,3}$ ]] && ((10#$2 >= 10)) || die "--duration needs 10-999 seconds"; dur=$((10#$2)); shift ;;
+            --port) is_port "${2:-}" || die "--port needs 1-65535"; port=$((10#$2)); shift ;;
+            -*) die "unknown option $1" ;;
+            *) [[ -z $name ]] || die "unexpected argument $1"; name=$1 ;;
+        esac
+        shift
+    done
+    [[ -n $name ]] || die "usage: $PROG test <name> [--port P] | test <name> --preflight [--duration S]"
+    need_root
+    load_tunnel "$name"
+    if ((pre)) && systemctl is-active --quiet "pubgre@$NAME" 2>/dev/null; then
+        die "pubgre@$NAME is running; preflight is for before 'up' (or after '$PROG down $NAME')"
+    fi
+    trap cleanup EXIT
+    trap 'exit 130' INT TERM
+    lock
+    if ((pre)); then preflight "$dur"; else live_test "$port"; fi
+}
+
+# ---------------------------------------------------------------- status
+
+fmt_bps() { awk -v b="$1" 'BEGIN { if (b >= 1e9) printf "%.2f Gbit/s", b / 1e9; else if (b >= 1e6) printf "%.2f Mbit/s", b / 1e6; else if (b >= 1e3) printf "%.1f kbit/s", b / 1e3; else printf "%d bit/s", b }'; }
+show_counters() {
+    local tbl
+    for tbl in filter mangle nat; do
+        ipt -t "$tbl" -L -v -n -x 2>/dev/null | awk -v t="$tbl" -v tag="/* pubgre_${NAME}_" '
+            /^Chain / { chain = $2; next }
+            { i = index($0, tag); if (!i) next
+              p = substr($0, i + length(tag)); sub(/ \*\/.*/, "", p)
+              printf "    %-7s %-12s %-10s %12s pkts %14s bytes\n", t, chain, p, $1, $2 }'
+    done
+}
+
+status_one() {
+    local svc en st n dec r1 t1 r2 t2 f
+    load_tunnel "$1"
+    svc=$(systemctl is-active "pubgre@$NAME" 2>/dev/null)
+    en=$(systemctl is-enabled "pubgre@$NAME" 2>/dev/null)
+    hdr "Tunnel $NAME ($ROLE)"
+    kv "service" "${svc:-unknown} (${en:-unknown})"
+    if [[ -e /sys/class/net/$IFN ]]; then
+        st=$(cat "/sys/class/net/$IFN/operstate" 2>/dev/null)
+        kv "interface" "$IFN  state ${st:-?}  mtu $(dev_mtu "$IFN")"
+    else
+        kv "interface" "$IFN absent (tunnel is down)"
+    fi
+    kv "GRE" "$L -> $R  key $KEY"
+    dec=$(route_field dev "$R" from "$L")
+    n=$(route_field via "$R" from "$L")
+    if [[ $dec == "$EG" ]]; then
+        kv "outer path" "via ${n:-direct} dev $dec (pinned to $EG)"
+    else
+        kv "outer path" "via ${n:-direct} dev ${dec:-?}  NOT pinned to $EG"
+    fi
+    if [[ -e /sys/class/net/$IFN ]] && ping -n -c1 -W1 "$TR" >/dev/null 2>&1; then
+        kv "link" "$TL <-> $TR  peer reachable"
+    else
+        kv "link" "$TL <-> $TR  peer NOT answering"
+    fi
+    kv "transported" "$T/$TP gateway $GW"
+
+    hdr "  Proxy ARP"
+    if [[ $ROLE == foreign ]]; then
+        kv "mode" "$TMODE on $TD"
+        if ip -4 neigh show proxy 2>/dev/null | has "^$(re "$T") dev $(re "$TD")( |$)"; then kv "proxy entry" "$T on $TD present"; else kv "proxy entry" "$T on $TD MISSING"; fi
+        kv "$TD sysctls" "proxy_arp=$(sysctl_get "net/ipv4/conf/$TD/proxy_arp") proxy_delay=$(sysctl_get "net/ipv4/neigh/$TD/proxy_delay") forwarding=$(sysctl_get "net/ipv4/conf/$TD/forwarding")"
+        dec=$(route_field dev "$T" from "$GW" iif "$TD")
+        kv "decision" "ARP for $T from $GW -> route dev ${dec:-none} ($([[ $dec == "$IFN" ]] && echo answers || echo 'NO reply'))"
+        n=$(ip -4 neigh show "$GW" dev "$TD" 2>/dev/null)
+        kv "provider gateway" "${n:-not resolved}"
+        n=$(ipt_count filter fwd-out)
+        kv "peer side" "$([[ ${n:-0} -gt 0 ]] && echo "router traffic is arriving ($n pkts): the local side answers its ARP" || echo "no router traffic seen yet")"
+    else
+        kv "mode" "$CAM on $CD (router MAC pin: $RMAC${O[router_mac_pinned]:+, pinned ${O[router_mac_pinned]}})"
+        kv "$CD sysctls" "proxy_arp=$(sysctl_get "net/ipv4/conf/$CD/proxy_arp") proxy_delay=$(sysctl_get "net/ipv4/neigh/$CD/proxy_delay") forwarding=$(sysctl_get "net/ipv4/conf/$CD/forwarding")"
+        dec=$(route_field dev "$GW" from "$T" iif "$CD")
+        [[ $CAM == proxy ]] && kv "decision" "ARP for $GW from $T -> route dev ${dec:-none} ($([[ $dec == "$IFN" ]] && echo answers || echo 'NO reply'))"
+        n=$(ip -4 neigh show "$T" dev "$CD" 2>/dev/null)
+        kv "router neighbour" "${n:-never seen}"
+        n=$(ipt_count filter fwd-out)
+        kv "router ARPed gw?" "$([[ ${n:-0} -gt 0 ]] && echo "yes: $n packets sent through us via $GW" || echo "no outbound traffic from the router yet")"
+        n=$(ipt_count filter fwd-in)
+        kv "peer side" "$([[ ${n:-0} -gt 0 ]] && echo "inbound for $T arriving ($n pkts): the foreign side's proxy ARP works" || echo "no inbound packets for $T yet")"
+    fi
+
+    hdr "  Routing"
+    ip -4 rule show 2>/dev/null | awk -F: -v lo="$PRIO" -v hi="$((PRIO + 9))" '$1 + 0 >= lo && $1 + 0 <= hi {print "    rule " $0}'
+    ip -4 route show table main proto "$RT_PROTO" 2>/dev/null | awk -v t="$T" '$1 == t {print "    main:   " $0}'
+    ip -4 route show table "$TM" 2>/dev/null | sed "s/^/    $TM:   /"
+    ip -4 route show table "$TPN" 2>/dev/null | sed "s/^/    $TPN:   /"
+
+    hdr "  MTU"
+    kv "egress $EG" "$(dev_mtu "$EG")"
+    kv "tunnel" "$MTU  (= egress - $GRE_OVERHEAD: IPv4 20 + GRE 4 + key 4)"
+    kv "TCP MSS" "$((MTU - 40))  (clamped to PMTU on FORWARD -o $IFN)"
+    kv "router WAN MTU" "$MTU recommended"
+
+    hdr "  iptables (tag pubgre_${NAME}_*)"
+    show_counters
+
+    if [[ -e /sys/class/net/$IFN ]]; then
+        f=/sys/class/net/$IFN/statistics
+        read -r r1 <"$f/rx_bytes"
+        read -r t1 <"$f/tx_bytes"
+        sleep 1
+        read -r r2 <"$f/rx_bytes"
+        read -r t2 <"$f/tx_bytes"
+        hdr "  Throughput (1s sample)"
+        kv "rx / tx" "$(fmt_bps $(((r2 - r1) * 8))) / $(fmt_bps $(((t2 - t1) * 8)))"
+        kv "totals" "rx $(numfmt --to=iec "$r2" 2>/dev/null || echo "$r2")B  tx $(numfmt --to=iec "$t2" 2>/dev/null || echo "$t2")B"
+    fi
+
+    hdr "  Drift"
+    if [[ $svc == active ]]; then
+        check_drift
+        if ((${#DRIFT[@]})); then
+            printf '    would change: %s\n' "${DRIFT[@]}"
+        else
+            say "    in sync with the configuration"
+        fi
+    else
+        say "    service not running; drift not evaluated"
+    fi
+}
+
+cmd_status() {
+    local n names
+    need_root
+    if (($#)); then
+        status_one "$1"
+        return
+    fi
+    names=$(tunnel_names)
+    [[ -n $names ]] || { say "no tunnels configured"; return 0; }
+    for n in $names; do status_one "$n"; done
+}
+
+# ---------------------------------------------------------------- install
+
+cmd_install() {
+    local id src missing=() t tmp
+    need_root
+    id=$(awk -F= '$1 == "ID" {gsub(/"/, "", $2); print $2}' /etc/os-release 2>/dev/null)
+    [[ $id == ubuntu || $id == debian ]] || warn "untested distribution '${id:-unknown}'; continuing"
+    for t in ip iptables systemctl flock ss ping modprobe awk stat mktemp timeout cksum; do
+        command -v "$t" >/dev/null || missing+=("$t")
+    done
+    ((${#missing[@]} == 0)) || die "missing tools: ${missing[*]}. Install them with apt; pubgre never installs packages."
+    for t in tcpdump python3 nc; do
+        command -v "$t" >/dev/null || note "optional '$t' not found (used by 'test' for deeper diagnosis)"
+    done
+    modprobe -n ip_gre 2>/dev/null || [[ -d /sys/module/ip_gre ]] || warn "kernel module ip_gre not available"
+    src=$(readlink -f -- "${BASH_SOURCE[0]}")
+    [[ -f $src ]] || die "run install from a downloaded file (curl -fsSLo pubgre <url> && sudo bash pubgre install), not from a pipe"
+    if [[ $src != "$BIN_PATH" ]]; then
+        install -m 0755 -o root -g root -- "$src" "$BIN_PATH" || die "cannot install $BIN_PATH"
+    fi
+    install -d -m 0700 -o root -g root "$CONF_DIR" "$STATE_DIR" || die "cannot create $CONF_DIR / $STATE_DIR"
+    tmp=$(mktemp "$UNIT_PATH.XXXXXX") || die "cannot write $UNIT_PATH"
+    cat >"$tmp" <<EOF
+[Unit]
+Description=pubgre tunnel %i (reconciles every ${LOOP_INTERVAL}s)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=$BIN_PATH reconcile %i --loop $LOOP_INTERVAL
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 644 "$tmp" && mv -f "$tmp" "$UNIT_PATH" || die "cannot write $UNIT_PATH"
+    systemctl daemon-reload
+    ok "installed $BIN_PATH and $UNIT_PATH ($(iptables -V 2>/dev/null))"
+    say "  next: $PROG create"
+}
+
+# ---------------------------------------------------------------- main
+
+usage() {
+    cat <<EOF
+$PROG $VERSION - carry a real public IPv4 address across a routed GRE tunnel (no NAT)
+
+usage:
+  $PROG install                         install to $BIN_PATH and the systemd template unit
+  $PROG create [flags]                  define a tunnel (prompts for anything not given)
+  $PROG up <name>                       apply now and enable pubgre@<name> (reconciles every ${LOOP_INTERVAL}s)
+  $PROG down <name>                     stop and reverse everything; keep the config
+  $PROG status [name]                   tunnel, proxy ARP, routes, MTU, counters, throughput, drift
+  $PROG test <name> [--port P]          prove the transported IP works end to end (default port 80)
+  $PROG test <name> --preflight [--duration S]
+                                        before 'up': verify GRE in both directions (run on both hosts)
+  $PROG teardown <name> [--yes]         down + delete config and state
+  $PROG reconcile <name> [--loop S | --check]
+
+create flags:
+  --role foreign|local      --name NAME              --local-public IP     --remote-public IP
+  --egress-dev NIC          --egress-gw IP|none      --tunnel-subnet NET/30 | FOREIGN_IP,LOCAL_IP
+  --gre-key N               --mtu N                  --transported-ip IP   --transported-gw IP
+  --transported-mask MASK   foreign: --transported-dev NIC --transported-mode onlink|routed
+  local: --client-dev NIC   --client-arp-mode proxy|gwaddr   --router-mac off|auto|MAC
+EOF
+}
+
+main() {
+    local cmd=${1:-help}
+    (($#)) && shift
+    case $cmd in
+        install) cmd_install "$@" ;;
+        create) cmd_create "$@" ;;
+        up) cmd_up "$@" ;;
+        down) cmd_down "$@" ;;
+        status) cmd_status "$@" ;;
+        test) cmd_test "$@" ;;
+        teardown) cmd_teardown "$@" ;;
+        reconcile) cmd_reconcile "$@" ;;
+        -V | --version | version) say "$PROG $VERSION" ;;
+        -h | --help | help) usage ;;
+        *) usage >&2; exit 2 ;;
+    esac
+}
+
+main "$@"
